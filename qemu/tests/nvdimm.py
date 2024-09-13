@@ -154,7 +154,6 @@ def run(test, params, env):
                 hotplug_test.hotplug_memory(vm, mem)
             time.sleep(10)
             mems += target_mems
-        nvdimm_test.run_guest_cmd(params["repo_install_cmd"])
         error_context.context("Verify nvdimm in monitor and guest", test.log.info)
         pkgs = params.objects("depends_pkgs")
         if not utils_package.package_install(pkgs, nvdimm_test.session):
@@ -166,9 +165,11 @@ def run(test, params, env):
         error_context.context("Format and mount nvdimm in guest", test.log.info)
         nvdimm_test.mount_nvdimm()
         if params.get("nvml_test", "no") == "yes":
+            nvdimm_test.run_guest_cmd(params["export_pmem_conf"])
             nvdimm_test.run_guest_cmd(params["get_nvml"])
             nvdimm_test.run_guest_cmd(params["compile_nvml"])
             nvdimm_test.run_guest_cmd(params["config_nvml"])
+            nvdimm_test.run_guest_cmd(params["build_tests"])
             nvdimm_test.run_guest_cmd(params["run_test"], timeout=3600)
             return
         nv_file = params.get("nv_file", "/mnt/nv")

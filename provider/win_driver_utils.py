@@ -5,12 +5,16 @@ windows driver utility functions.
 """
 import logging
 import re
+import os
 import time
+import aexpect
 
 from virttest import error_context
 from virttest import utils_misc
 from virttest import utils_test
-from virttest.utils_windows import virtio_win, wmic
+from virttest import data_dir
+from virttest.utils_windows import virtio_win, wmic, system
+from virttest.utils_version import VersionInterval
 
 LOG_JOB = logging.getLogger('avocado.test')
 
@@ -61,7 +65,15 @@ def uninstall_driver(session, test, devcon_path, driver_name,
     # find the inf name and remove the repeated one
     inf_list_all = _pnpdrv_info(session, device_name, ["InfName"])
     inf_list = list(set(inf_list_all))
-    uninst_store_cmd = "pnputil /f /d %s" % inf_list[0]
+
+    # pnputil flags available starting in Windows 10,
+    #  version 1607, build 14393 later
+    build_ver = system.version(session).split('.')[2]
+    if int(build_ver) > 14393:
+        uninst_store_cmd = ("pnputil /delete-driver %s /uninstall /force"
+                            % inf_list[0])
+    else:
+        uninst_store_cmd = "pnputil /f /d %s" % inf_list[0]
     status, output = session.cmd_status_output(uninst_store_cmd,
                                                INSTALL_TIMEOUT)
     if status:
@@ -148,23 +160,93 @@ def install_driver_by_virtio_media(session, test, devcon_path, media_type,
                    "by hwids: '%s'" % device_hwid)
 
 
-def install_driver_by_installer(session, test, run_install_cmd,
-                                installer_pkg_check_cmd):
+def autoit_installer_check(params, session):
     """
-    Install driver by installer.
+    Check if AUTOIT3.EXE is running.
+    :param params: the dict used for parameters
+    :param session: The guest session object.
+    :return: True if it is running.
+    """
+    autoit_check_cmd = params.get("autoit_check_cmd",
+                                  "tasklist |findstr /i autoit3_.*exe")
+    try:
+        return session.cmd_status(autoit_check_cmd) == 0
+    except (aexpect.ShellTimeoutError,
+            aexpect.ShellProcessTerminatedError,
+            aexpect.ShellStatusError):
+        LOG_JOB.info("VM is rebooting...")
+        return False
 
+
+def run_installer(vm, session, test, params, run_installer_cmd):
+    """
+    Install/uninstall/repair virtio-win drivers and qxl,spice and
+    qemu-ga-win by installer.
+    If installer(virtio-win) version is in [1.9.37, 1.9.40]
+    then installer itself will restart vm for installation and
+    uninstallation function; otherwise there is no need to reboot guest.
+    While for repair function, installer itself always restart vm by
+    itself;
+
+    :param vm: vm object.
     :param session: The guest session object.
     :param test: kvm test object
-    :param run_install_cmd: install cmd.
-    :param installer_pkg_check_cmd: installer pkg check cmd.
+    :param params: the dict used for parameters
+    :param run_installer_cmd: install/uninstall/repair cmd.
+    :return session: a new session after restart of installer
     """
-    run_install_cmd = utils_misc.set_winutils_letter(
-                                session, run_install_cmd)
-    session.cmd(run_install_cmd)
-    if not utils_misc.wait_for(lambda: not session.cmd_status(
-                                installer_pkg_check_cmd), 360):
-        test.fail("Virtio-win-guest-tools is not installed.")
-    time.sleep(60)
+    cdrom_virtio = params["cdrom_virtio"]
+    installer_restart_version = params.get("installer_restart_version",
+                                           "[1.9.37.0, 1.9.40.0]")
+    cdrom_virtio_path = os.path.basename(utils_misc.get_path(
+        data_dir.get_data_dir(), cdrom_virtio))
+    match = re.search(r"virtio-win-(\d+\.\d+(?:\.\d+)?-\d+)",
+                      cdrom_virtio_path)
+    cdrom_virtio_version = re.sub('-', '.', match.group(1))
+    # run installer cmd
+    run_installer_cmd = utils_misc.set_winutils_letter(
+        session, run_installer_cmd)
+    session.cmd(run_installer_cmd)
+
+    if not utils_misc.wait_for(lambda: not autoit_installer_check(
+            params, session), 240, 2, 2):
+        test.fail("Autoit exe stop there for 240s,"
+                  " please have a check.")
+    restart_con_ver = cdrom_virtio_version in VersionInterval(
+        installer_restart_version)
+    restart_con_repair = "repair" in run_installer_cmd
+    if restart_con_ver or restart_con_repair:
+        # Wait for vm re-start by installer itself
+        if not utils_misc.wait_for(lambda: not session.is_responsive(),
+                                   120, 5, 5):
+            test.fail("The previous session still exists,"
+                      "seems that the vm doesn't restart.")
+        session = vm.wait_for_login(timeout=360)
+    # for the early virtio-win instller, rebooting is needed.
+    if cdrom_virtio_version in VersionInterval("(,1.9.37.0)"):
+        session = vm.reboot(session)
+    return session
+
+
+def remove_driver_by_msi(session, vm, params):
+    """
+    Remove virtio_win drivers by msi.
+
+    :param session: The guest session object
+    :param vm:
+    :param params: the dict used for parameters
+    :return: a new session after restart os
+    """
+    media_type = params.get("virtio_win_media_type", "iso")
+    get_drive_letter = getattr(virtio_win, "drive_letter_%s" % media_type)
+    drive_letter = get_drive_letter(session)
+    msi_path = drive_letter + "\\" + params["msi_name"]
+    msi_uninstall_cmd = params["msi_uninstall_cmd"] % msi_path
+    vm.send_key('meta_l-d')
+    # msi uninstall cmd will restart os.
+    session.cmd(msi_uninstall_cmd)
+    time.sleep(15)
+    return vm.wait_for_login(timeout=360)
 
 
 def copy_file_to_samepath(session, test, params):
@@ -180,6 +262,7 @@ def copy_file_to_samepath(session, test, params):
     dst_path = r"C:\\"
     vol_virtio_key = "VolumeName like '%virtio-win%'"
     vol_virtio = utils_misc.get_win_disk_vol(session, vol_virtio_key)
+
     installer_path = r"%s:\%s" % (vol_virtio, "virtio-win-guest-tools.exe")
     install_script_path = utils_misc.set_winutils_letter(session,
                                                          params["install_script_path"])
@@ -187,8 +270,16 @@ def copy_file_to_samepath(session, test, params):
                                                         params["repair_script_path"])
     uninstall_script_path = utils_misc.set_winutils_letter(session,
                                                            params["uninstall_script_path"])
-    src_files = [installer_path, install_script_path, repair_script_path,
-                 uninstall_script_path]
+    src_files = [installer_path, install_script_path,
+                 repair_script_path, uninstall_script_path]
+    if params.get("msi_name"):
+        msi_path = r"%s:\%s" % (vol_virtio, params["msi_name"])
+        uninstall_msi_script_path = utils_misc.set_winutils_letter(
+            session,
+            params["uninstall_msi_script_path"]
+        )
+        src_files.extend([msi_path, uninstall_msi_script_path])
+
     for src_file in src_files:
         copy_cmd = "xcopy %s %s /Y" % (src_file, dst_path)
         status, output = session.cmd_status_output(copy_cmd)

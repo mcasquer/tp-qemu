@@ -39,7 +39,7 @@ def run(test, params, env):
     vcpu_threads_list = [1, 2]
     if params['machine_type'] == 'pseries':
         vcpu_threads_list = [1, 2, 4, 8]
-    if 'arm64' in params['machine_type']:
+    if 'arm64' in params['machine_type'] or 's390' in params['machine_type']:
         vcpu_threads_list = [1]
     host_cpu = cpu.online_count()
     params['vcpu_cores'] = vcpu_cores = random.randint(1, min(6, host_cpu//2))
@@ -71,7 +71,8 @@ def run(test, params, env):
                 raise
         vm = env.get_vm(vm_name)
         session = vm.wait_for_login()
-        if not check_if_vm_vcpu_topology_match(session, os_type, vm.cpuinfo):
+        if not check_if_vm_vcpu_topology_match(session, os_type, vm.cpuinfo,
+                                               test, vm.devices):
             test.fail('CPU topology of guest is incorrect.')
         if params.get('check_siblings_cmd'):
             check('sibling', vcpu_threads * vcpu_cores, params['check_siblings_cmd'])

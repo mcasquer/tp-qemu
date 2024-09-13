@@ -201,7 +201,7 @@ class StorageBenchmark(object):
             """
             Find the path of the given executable file in windows.
             """
-            cmd_dir = r'CD %s && DIR /S /B %s.exe' % (dst, self.name)
+            cmd_dir = r'DIR /S /B "%s" | find "%s.exe"' % (dst, self.name)
             s, o = self.session.cmd_status_output(cmd_dir, timeout=timeout)
             if not s:
                 return '"{}"'.format(o.splitlines()[0])
@@ -372,7 +372,7 @@ class FioWinCfg(object):
         label = params.get('win_utils_label', 'WIN_UTILS')
         utils_letter = utils_misc.get_winutils_vol(session, label)
         arch = params.get('vm_arch_name', 'x84_64')
-        fio_ver = params.get('fio_ver', 'fio-3.1')
+        fio_ver = params.get('fio_ver', 'fio-latest')
         self.fio_inst = {'x86_64': r'C:\Program Files (x86)\fio',
                          'i686': r'C:\Program Files\fio'}
         self.fio_msi = {'x86_64': r'%s:\%s-x64.msi' % (utils_letter, fio_ver),

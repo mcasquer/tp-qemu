@@ -71,16 +71,41 @@ def run(test, params, env):
         netdst = params.get("netdst", "switch")
         host_bridges = utils_net.Bridge()
         br_in_use = host_bridges.list_br()
+        target_ifaces = []
         if netdst in br_in_use:
             ifaces_in_use = host_bridges.list_iface()
             target_ifaces = list(ifaces_in_use + br_in_use)
-        if params.get("netdst_nic1") in process.system_output(
-                "ovs-vsctl list-br", ignore_status=True, shell=True).decode():
-            ovs_list = "ovs-vsctl list-ports %s" % params["netdst_nic1"]
-            ovs_port = process.system_output(ovs_list,
-                                             shell=True).decode().splitlines()
-            target_ifaces = target_ifaces + \
-                params.objects("netdst_nic1") + ovs_port
+        if process.system("which ovs-vsctl && systemctl status openvswitch.service",
+                          ignore_status=True, shell=True) == 0:
+            ovs_br_all = netperf_base.ssh_cmd(host, "ovs-vsctl list-br")
+            ovs_br = []
+            if ovs_br_all:
+                for nic in vm.virtnet:
+                    if nic.netdst in ovs_br_all:
+                        ovs_br.append(nic.netdst)
+                    elif nic.nettype == "vdpa":
+                        vf_pci = netperf_base.ssh_cmd(
+                                host,
+                                "vdpa dev show |grep %s | grep -o 'pci/[^[:space:]]*' | awk -F/ '{print $2}'"
+                                % nic.netdst)
+                        pf_pci = netperf_base.ssh_cmd(
+                                host,
+                                "grep PCI_SLOT_NAME /sys/bus/pci/devices/%s/physfn/uevent | cut -d'=' -f2"
+                                % vf_pci)
+                        port = netperf_base.ssh_cmd(
+                                host,
+                                "ls /sys/bus/pci/devices/%s/net/ | head -n 1"
+                                % pf_pci)
+                        ovs_br_vdpa = netperf_base.ssh_cmd(host, "ovs-vsctl port-to-br %s" % port)
+                        cmd = "ovs-ofctl add-flow {} 'in_port=1,idle_timeout=0 actions=output:2'".format(ovs_br_vdpa)
+                        cmd += "&&  ovs-ofctl add-flow {} 'in_port=2,idle_timeout=0 actions=output:1'".format(ovs_br_vdpa)
+                        cmd += "&&  ovs-ofctl dump-flows {}".format(ovs_br_vdpa)
+                        netperf_base.ssh_cmd(host, cmd)
+                        ovs_br.append(ovs_br_vdpa)
+                for br in ovs_br:
+                    ovs_list = "ovs-vsctl list-ports %s" % br
+                    ovs_port = netperf_base.ssh_cmd(host, ovs_list)
+                    target_ifaces.extend(ovs_port.split() + [br])
         if vm.virtnet[0].nettype == "macvtap":
             target_ifaces.extend([vm.virtnet[0].netdst, vm.get_ifname(0)])
         error_context.context("Change all Bridge NICs MTU to %s"
@@ -409,6 +434,7 @@ def start_test(server, server_ctl, host, clients, resultsdir, test_duration=60,
 
     for protocol in protocols.split():
         error_context.context("Testing %s protocol" % protocol, test.log.info)
+        protocol_log = ""
         if protocol in ("TCP_RR", "TCP_CRR"):
             sessions_test = sessions_rr.split()
             sizes_test = sizes_rr.split()
@@ -456,6 +482,7 @@ def start_test(server, server_ctl, host, clients, resultsdir, test_duration=60,
                                                     header=record_header,
                                                     base=base,
                                                     fbase=fbase)
+                    category = ""
                     if record_header:
                         record_header = False
                         category = row.split('\n')[0]
@@ -566,9 +593,12 @@ def launch_client(sessions, server, server_ctl, host, clients, l, nf_args,
         return intr
 
     def get_state():
+        ifname = None
         for i in netperf_base.ssh_cmd(server_ctl, "ifconfig").split("\n\n"):
             if server in i:
                 ifname = re.findall(r"(\w+\d+)[:\s]", i)[0]
+        if ifname is None:
+            raise RuntimeError(f"no available iface associated with {server}")
 
         path = "find /sys/devices|grep net/%s/statistics" % ifname
         cmd = "%s/rx_packets|xargs cat;%s/tx_packets|xargs cat;" \

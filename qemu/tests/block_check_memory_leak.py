@@ -1,12 +1,14 @@
 """Check memory leak on block devices"""
 
 import os
+import re
 import time
 
 from avocado.utils import process
 from virttest import data_dir as virttest_data_dir
 from virttest import error_context
 from virttest.utils_misc import get_linux_drive_path
+from virttest import arch
 
 
 @error_context.context_aware
@@ -42,6 +44,13 @@ def run(test, params, env):
         logger.info("Execute io:%s", guest_io_cmd)
         session.sendline("$SHELL " + guest_io_cmd)
 
+    if arch.ARCH in ('ppc64', 'ppc64le'):
+        output = process.system_output("lscfg --list firmware -v", shell=True).decode()
+        ver = float(re.findall(r'\d\.\d', output)[0])
+        if ver >= 6.3:
+            #bz2235228,cancel test due to known product bug.
+            test.cancel("Skip test for xive kvm interrupt guest due to"
+                        " known host crash issue.")
     logger = test.log
     data_images = params['data_images'].split()
     error_context.context("Get the main VM", logger.info)

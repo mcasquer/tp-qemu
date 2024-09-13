@@ -122,10 +122,14 @@ def run(test, params, env):
         error_context.context("Uninstalling previous installed driver",
                               test.log.info)
         for inf_name in _pnpdrv_info(session, device_name, ["InfName"]):
-            uninst_store_cmd = "pnputil /f /d %s" % inf_name
+            pnp_cmd = "pnputil /delete-driver %s /uninstall /force"
+            uninst_store_cmd = params.get("uninst_store_cmd",
+                                          pnp_cmd) % inf_name
             status, output = session.cmd_status_output(uninst_store_cmd,
                                                        inst_timeout)
-            if status:
+            if status not in (0, 3010):
+                # for viostor and vioscsi, they need system reboot
+                # acceptable status: OK(0), REBOOT(3010)
                 test.error("Failed to uninstall driver '%s' from store, "
                            "details:\n%s" % (driver_name, output))
 

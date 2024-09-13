@@ -131,36 +131,10 @@ def run(test, params, env):
         error_context.context("Try to %s VirtioFsSvc service." % action,
                               test.log.info)
         session.cmd(cmd)
-        output = session.cmd_output(viofs_sc_query_cmd)
+        output = session.cmd_output(viofs_sc_query_cmd)  # pylint: disable=E0606
         if expect_status not in output:
             test.fail("Could not %s VirtioFsSvc service, "
                       "detail: '%s'" % (action, output))
-
-    def enable_debug_log(session):
-        """
-        Only for windows guest, enable debug log in guest.
-        :param session: vm session
-        :return: session
-        """
-        viofs_debug_enable_cmd = params.get("viofs_debug_enable_cmd")
-        viofs_log_enable_cmd = params.get("viofs_log_enable_cmd")
-        if viofs_debug_enable_cmd and viofs_log_enable_cmd:
-            error_context.context("Check if virtiofs debug log is enabled in guest.",
-                                  test.log.info)
-            cmd = params.get("viofs_reg_query_cmd")
-            ret = session.cmd_output(cmd)
-            if "debugflags" not in ret.lower() or "debuglogfile" not in ret.lower():
-                error_context.context("Configure virtiofs debug log.", test.log.info)
-                for reg_cmd in (viofs_debug_enable_cmd, viofs_log_enable_cmd):
-                    error_context.context("Set %s " % reg_cmd, test.log.info)
-                    s, o = session.cmd_status_output(reg_cmd)
-                    if s:
-                        test.fail("Fail command: %s. Output: %s" % (reg_cmd, o))
-                error_context.context("Reboot guest.", test.log.info)
-                session = vm.reboot()
-            else:
-                test.log.info("Virtiofs debug log is enabled.")
-        return session
 
     def start_multifs_instance():
         """
@@ -413,8 +387,12 @@ def run(test, params, env):
                 if params.get("viofs_svc_name", "VirtioFsSvc") == "VirtioFsSvc":
                     error_context.context("Start virtiofs service in guest.",
                                           test.log.info)
+                    debug_log_operation = params.get("debug_log_operation")
+                    if debug_log_operation:
+                        session = virtio_fs_utils.operate_debug_log(
+                            test, params, session, vm, debug_log_operation
+                        )
                     virtio_fs_utils.start_viofs_service(test, params, session)
-                    session = enable_debug_log(session)
                 else:
                     error_context.context("Start winfsp.launcher"
                                           " instance in guest.", test.log.info)
@@ -427,7 +405,7 @@ def run(test, params, env):
                                       test.log.info)
                 vol_con = "VolumeName='%s'" % virtio_fs_disk_label
                 volume_letter = utils_misc.wait_for(
-                    lambda: utils_misc.get_win_disk_vol(session, condition=vol_con), cmd_timeout)
+                    lambda: utils_misc.get_win_disk_vol(session, condition=vol_con), cmd_timeout)  # pylint: disable=E0606
                 if volume_letter is None:
                     test.fail("Could not get virtio-fs mounted volume letter.")
                 fs_dest = "%s:" % volume_letter
@@ -529,32 +507,67 @@ def run(test, params, env):
                 if cmd_symblic_file:
                     error_context.context("Symbolic test under %s inside "
                                           "guest." % fs_dest, test.log.info)
+                    cmd_create_file = params["cmd_create_file"]
                     session.cmd(cmd_new_folder % fs_dest)
+                    session.cmd(cmd_create_file)
+                    session.cmd(cmd_copy_file)
                     if session.cmd_status(cmd_symblic_file):
                         test.fail("Creat symbolic files failed.")
                     if session.cmd_status(cmd_symblic_folder):
                         test.fail("Creat symbolic folders failed.")
+
+                    error_context.context("Compare symbolic link info in "
+                                          "the host and guest", test.log.info)
+
+                    def __file_check(file, os_type):
+                        cmd_map = {'win_host': 'cat %s',
+                                   'win_guest': 'type %s',
+                                   'linux_host': 'ls -l %s',
+                                   'linux_guest': 'ls -l %s'}
+                        if 'guest' in os_type:
+                            o = session.cmd_output(cmd_map[os_type] % file)
+                        else:
+                            o = process.run(cmd_map[os_type] % file).stdout_text
+                        return o.strip().split()[-1]
+
                     if os_type == "linux":
-                        error_context.context("Compare symbolic link info in "
-                                              "the host and guest", test.log.info)
-
-                        def __file_check(file, guest=None):
-                            if guest:
-                                o = session.cmd_output("ls -l %s" % file)
-                            else:
-                                o = process.run("ls -l %s" % file).stdout_text
-                            return o.strip().split()[-1]
-
-                        if (__file_check(file_link, 'guest') !=
-                                __file_check(os.path.join(fs_source, file_link))):
+                        file_link_host = os.path.join(fs_source, file_link)
+                        if (__file_check(file_link, 'linux_guest') !=
+                                __file_check(file_link_host, 'linux_host')):
                             test.fail("Symbolic file configured in host "
                                       "and guest are inconsistent")
-                        if (__file_check(folder_link, 'guest') !=
-                                __file_check(os.path.join(fs_source, folder_link))):
+                        folder_link_host = os.path.join(fs_source,
+                                                        folder_link)
+                        if (__file_check(folder_link, 'linux_guest') !=
+                                __file_check(folder_link_host, 'linux_host')):
                             test.fail("Symbolic folder configured in "
                                       "host and guest are inconsistent")
                         session.cmd("cd -")
                     else:
+                        content = session.cmd_output("type %s" %
+                                                     test_file).strip()
+                        link_guest = __file_check(file_link, 'win_guest')
+                        file_link_host = os.path.join(fs_source, file_link)
+                        link_host = __file_check(file_link_host, 'win_host')
+                        if link_guest != content or link_host != content:
+                            test.fail("Symbolic file check failed,"
+                                      " the real content is %s\n"
+                                      "the link file content in guest is %s\n"
+                                      "the link file content in host is %s." %
+                                      (content, link_guest, link_host))
+                        # check the file in folder link
+                        folder_link_guest = folder_link + "\\" + test_file
+                        link_guest = __file_check(folder_link_guest, 'win_guest')
+                        folder_link_host = os.path.join(fs_source,
+                                                        folder_link,
+                                                        test_file)
+                        link_host = __file_check(folder_link_host, 'win_host')
+                        if link_guest != content or link_host != content:
+                            test.fail("Symbolic folder check failed,"
+                                      " the real content is %s\n"
+                                      "the link file content in guest is %s\n"
+                                      "the link file content in host is %s." %
+                                      (content, link_guest, link_host))
                         session.cmd("cd /d C:\\")
 
                 if fio_options:
@@ -720,7 +733,7 @@ def run(test, params, env):
                             xattr_content = session.cmd_output(getfattr_cmd %
                                                                (xattr, object))
                             result = re.search(full_pattern, xattr_content)
-                        if not result:
+                        if not result:  # pylint: disable=E0606
                             test.fail("Attribute is not correct, the pattern is %s\n"
                                       " the attribute is %s." % (full_pattern,
                                                                  xattr_content))

@@ -24,10 +24,11 @@ from virttest import utils_net
 from virttest import data_dir
 from virttest import storage
 from virttest import qemu_migration
+from virttest.utils_version import VersionInterval
 
 from virttest.utils_windows import virtio_win
 from provider.win_driver_installer_test import (uninstall_gagent,
-                                                install_test_with_screen_on_desktop)
+                                                run_installer_with_interaction)
 
 LOG_JOB = logging.getLogger('avocado.test')
 
@@ -167,18 +168,24 @@ class QemuGuestAgentTest(BaseVirtTest):
         s, o = session.cmd_status_output(cmd_check_status)
         return s == 0
 
-    def _get_main_qga_version(self, session, vm):
+    def _get_qga_version(self, session, vm, main_ver=True):
         """
-        Get qemu-guest-agent version in guest
+        Get qemu-guest-agent version or
+        main version in guest
         :param session: use for sending cmd
         :param vm: guest object.
         :return: main qga version
         """
         LOG_JOB.info("Get guest agent's main version for linux guest.")
         qga_ver = session.cmd_output(self.params["gagent_pkg_check_cmd"])
-        pattern = r"guest-agent-(\d+).\d+.\d+-\d+"
-        ver_main = int(re.findall(pattern, qga_ver)[0])
-        return ver_main
+        if main_ver:
+            pattern = r"guest-agent-(\d+).\d+.\d+-\d+"
+            ver_main = int(re.findall(pattern, qga_ver)[0])
+            return ver_main
+        else:
+            match = re.search(r'qemu-guest(-(agent))?-(\d+\.\d+\.\d+-\d+)', qga_ver)
+            full_ver = match.group(3)
+            return full_ver
 
     def gagent_install(self, session, vm):
         """
@@ -701,14 +708,21 @@ class QemuGuestAgentBasicCheck(QemuGuestAgentTest):
         error_context.context("the vcpu number:%d" % vcpus_num, LOG_JOB.info)
         if vcpus_num < 2:
             test.error("the vpus number of guest should be more than 1")
-        vcpus_info[vcpus_num - 1]["online"] = False
-        del vcpus_info[vcpus_num - 1]["can-offline"]
-        action = {'vcpus': [vcpus_info[vcpus_num - 1]]}
-        self.gagent.set_vcpus(action)
-        # Check if the result is as expected
-        vcpus_info = self.gagent.get_vcpus()
-        if vcpus_info[vcpus_num - 1]["online"] is not False:
-            test.fail("the vcpu status is not changed as expected")
+        for index in range(0, vcpus_num - 1):
+            if (vcpus_info[index]["online"] is True and
+                    vcpus_info[index]["can-offline"] is True and
+                    vcpus_info[index]['logical-id'] != 0):
+                vcpus_info[index]["online"] = False
+                del vcpus_info[index]["can-offline"]
+                action = {'vcpus': [vcpus_info[index]]}
+                self.gagent.set_vcpus(action)
+                # Check if the result is as expected
+                vcpus_info = self.gagent.get_vcpus()
+                if vcpus_info[index]["online"] is not False:
+                    test.fail("the vcpu status is not changed as expected")
+                break
+        else:
+            test.error("There is no vcpu that matching test condition.")
 
     @error_context.context_aware
     def gagent_check_set_mem_blocks(self, test, params, env):
@@ -1590,8 +1604,8 @@ class QemuGuestAgentBasicCheck(QemuGuestAgentTest):
                 else:
                     test.fail("The ip address type is %s, but it should be"
                               " ipv4 or ipv6." % ip["ip-address-type"])
-            if guest_ip_ipv4 != ip_addr_qga_ipv4 \
-                    or guest_ip_ipv6 != ip_addr_qga_ipv6:
+            if (guest_ip_ipv4 != ip_addr_qga_ipv4   # pylint: disable=E0606
+                    or guest_ip_ipv6 != ip_addr_qga_ipv6):  # pylint: disable=E0601
                 test.fail("Get the wrong ip address for %s interface:\n"
                           "ipv4 address from qga is %s, the expected is %s;\n"
                           "ipv6 address from qga is %s, the expected is %s."
@@ -1722,16 +1736,28 @@ class QemuGuestAgentBasicCheck(QemuGuestAgentTest):
         Now only linux guest has this behavior,but still leave interface
         for windows guest.
         """
+
         if self.params.get("os_type") == "linux":
-            cmd_black_list = self.params["black_list"]
-            cmd_blacklist_backup = self.params["black_list_backup"]
+            cmd_blacklist_backup = self.params["black_file_backup"]
             session.cmd(cmd_blacklist_backup)
+            full_qga_ver = self._get_qga_version(session, self.vm, main_ver=False)
+            value_full_qga_ver = (full_qga_ver in VersionInterval('[8.1.0-5,)'))
+            black_list_spec = self.params["black_list_spec"]
+            cmd_black_list = self.params["black_list"]
+            black_list_change_cmd = self.params["black_list_change_cmd"]
+            if value_full_qga_ver:
+                black_list_spec = "allow-rpcs"
+                cmd_black_list = self.params["black_list_new"]
+                black_list_change_cmd = "sed -i 's/allow-rpcs.*/allow-rpcs=%s\"/g' /etc/sysconfig/qemu-ga"
+            elif full_qga_ver in VersionInterval('[7.2.0-4,)'):
+                black_list_spec = "BLOCK_RPCS"
             for black_cmd in cmd_black_list.split():
-                bl_check_cmd = self.params["black_list_check_cmd"] % black_cmd
-                bl_change_cmd = self.params["black_list_change_cmd"] % black_cmd
+                bl_check_cmd = self.params["black_list_check_cmd"] % (black_list_spec, black_cmd)
+                bl_change_cmd = black_list_change_cmd % black_cmd
                 session.cmd(bl_change_cmd)
                 output = session.cmd_output(bl_check_cmd)
-                if not output == "":
+                if (output == "" and value_full_qga_ver or
+                        (not output == "" and not value_full_qga_ver)):
                     self.test.fail("Failed to change the cmd to "
                                    "white list, the output is %s" % output)
 
@@ -1950,8 +1976,8 @@ class QemuGuestAgentBasicCheck(QemuGuestAgentTest):
         error_context.context("Read the big file with an invalid count number",
                               LOG_JOB.info)
         if params.get("os_type") == "linux":
-            main_qga_ver = self._get_main_qga_version(session, self.vm)
-        if params.get("os_type") == "linux" and main_qga_ver <= 2:
+            main_qga_ver = self._get_qga_version(session, self.vm)
+        if params.get("os_type") == "linux" and main_qga_ver <= 2:  # pylint: disable=E0606
             # if resource is sufficient can read file,
             # else file handle will not be found.
             self.gagent.guest_file_read(ret_handle, count=10000000000)
@@ -2305,7 +2331,7 @@ class QemuGuestAgentBasicCheck(QemuGuestAgentTest):
     def _action_before_fsfreeze(self, *args):
         session = self._get_session(self.params, None)
         if self.params.get("os_type") == "linux":
-            session.cmd("restorecon -Rv /", timeout=180)
+            session.cmd("restorecon -Rv /mnt", timeout=180)
         self._open_session_list.append(session)
 
     @error_context.context_aware
@@ -2475,6 +2501,7 @@ class QemuGuestAgentBasicCheck(QemuGuestAgentTest):
 
         error_context.context("Format the new data disk and mount it.",
                               LOG_JOB.info)
+        mount_points = []
         if params.get("os_type") == "linux":
             self.gagent_setsebool_value('on', params, self.vm)
             disk_data = list(utils_disk.get_linux_disks(session).keys())
@@ -2646,6 +2673,7 @@ class QemuGuestAgentBasicCheck(QemuGuestAgentTest):
             disk_write_cmd = params["disk_write_cmd"]
             pause = float(params.get("virtio_block_pause", 10.0))
             error_context.context("Format and write disk", LOG_JOB.info)
+            mnt_point = None
             if params.get("os_type") == "linux":
                 new_disks = utils_misc.wait_for(
                     lambda: get_new_disk(
@@ -3412,8 +3440,18 @@ class QemuGuestAgentBasicCheck(QemuGuestAgentTest):
         error_context.context("Change command in blacklist and restart"
                               " agent service.", LOG_JOB.info)
         session.cmd("cp /etc/sysconfig/qemu-ga /etc/sysconfig/qemu-ga-bk")
+        full_qga_ver = self._get_qga_version(session, self.vm, main_ver=False)
+        black_list_spec = "BLACKLIST_RPC"
+        if full_qga_ver in VersionInterval('[8.1.0-5,)'):
+            black_list_spec, black_list_spec_replace = "allow-rpcs", "block-rpcs"
+        elif full_qga_ver in VersionInterval('[7.2.0-4,)'):
+            black_list_spec = "BLOCK_RPCS"
+        if black_list_spec == "allow-rpcs":
+            black_list_change_cmd = "sed -i 's/%s.*/%s=guest-info\"/g' /etc/sysconfig/qemu-ga" % (black_list_spec, black_list_spec_replace)  # pylint: disable=E0606
+        else:
+            black_list_change_cmd = "sed -i 's/%s.*/%s=guest-info/g' /etc/sysconfig/qemu-ga" % (black_list_spec, black_list_spec)
         try:
-            session.cmd(params["black_list_change_cmd"])
+            session.cmd(black_list_change_cmd)
             session.cmd(params["gagent_restart_cmd"])
 
             error_context.context("Try to execute guest-file-open and "
@@ -3923,16 +3961,23 @@ class QemuGuestAgentBasicCheckWin(QemuGuestAgentBasicCheck):
         """
         error_context.context("Get %s path where it locates." % qemu_ga_pkg,
                               LOG_JOB.info)
+        qemu_ga_pkg_path = ""
         if self.gagent_src_type == "url":
             gagent_host_path = params["gagent_host_path"]
             gagent_download_url = params["gagent_download_url"]
+            mqgaw_ver = re.search(r'(?:\d+\.){2}\d+', gagent_download_url)
+            mqgaw_ver_list = list(map(int, mqgaw_ver.group(0).split('.')))
+            mqgaw_name = (params["qga_bin"] if mqgaw_ver_list >= [105, 0, 1]
+                          else params["qga_bin_legacy"])
+            src_qgarpm_path = params["src_qgarpm_path"] % mqgaw_name
+            cmd_get_qgamsi_path = params["get_qgamsi_path"] % mqgaw_name
             qga_msi = params['qemu_ga_pkg']
             rpm_install = "rpm_install" in gagent_download_url
             if rpm_install:
                 gagent_download_url = gagent_download_url.split("rpm_install:")[-1]
                 gagent_download_cmd = 'wget -qP %s %s' % (gagent_host_path,
                                                           gagent_download_url)
-                gagent_host_path += params["src_qgarpm_path"]
+                gagent_host_path += src_qgarpm_path
             else:
                 gagent_host_path += qga_msi
                 gagent_download_cmd = 'wget %s %s' % (gagent_host_path,
@@ -3952,7 +3997,6 @@ class QemuGuestAgentBasicCheckWin(QemuGuestAgentBasicCheck):
             if rpm_install:
                 get_qga_msi = params["installrpm_getmsi"] % gagent_host_path
                 process.system(get_qga_msi, shell=True, timeout=10)
-                cmd_get_qgamsi_path = params["get_qgamsi_path"]
                 qgamsi_path = process.system_output(cmd_get_qgamsi_path,
                                                     shell=True)
                 qgamsi_path = qgamsi_path.decode(encoding="utf-8",
@@ -4400,7 +4444,6 @@ class QemuGuestAgentBasicCheckWin(QemuGuestAgentBasicCheck):
         """
 
         run_install_cmd = params["run_install_cmd"]
-        installer_pkg_check_cmd = params["installer_pkg_check_cmd"]
         gagent_uninstall_cmd = params["gagent_uninstall_cmd"]
 
         vm = env.get_vm(params["main_vm"])
@@ -4409,9 +4452,9 @@ class QemuGuestAgentBasicCheckWin(QemuGuestAgentBasicCheck):
         qga_ver_pkg = str(self.gagent.guest_info()["version"])
         uninstall_gagent(session, test, gagent_uninstall_cmd)
         session = vm.reboot(session)
-        install_test_with_screen_on_desktop(vm, session, test, run_install_cmd,
-                                            installer_pkg_check_cmd,
-                                            copy_files_params=params)
+        session = run_installer_with_interaction(vm, session, test, params,
+                                                 run_install_cmd,
+                                                 copy_files_params=params)
         qga_ver_installer = str(self.gagent.guest_info()["version"])
 
         error_context.context("Check if qga version is corresponding between"

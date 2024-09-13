@@ -20,15 +20,15 @@ from provider.vioinput_basic import key_tap_test as vioinput_test  # pylint: dis
 LOG_JOB = logging.getLogger('avocado.test')
 
 
-driver_name_list = ['viorng', 'viostor', 'vioscsi',
-                    'balloon', 'viofs', 'vioser',
+driver_name_list = ['balloon', 'viostor', 'vioscsi',
+                    'viorng', 'viofs', 'vioser',
                     'pvpanic', 'netkvm', 'vioinput',
                     'fwcfg']
 
-device_hwid_list = ['"PCI\\VEN_1AF4&DEV_1005" "PCI\\VEN_1AF4&DEV_1044"',
+device_hwid_list = ['"PCI\\VEN_1AF4&DEV_1002" "PCI\\VEN_1AF4&DEV_1045"',
                     '"PCI\\VEN_1AF4&DEV_1001" "PCI\\VEN_1AF4&DEV_1042"',
                     '"PCI\\VEN_1AF4&DEV_1004" "PCI\\VEN_1AF4&DEV_1048"',
-                    '"PCI\\VEN_1AF4&DEV_1002" "PCI\\VEN_1AF4&DEV_1045"',
+                    '"PCI\\VEN_1AF4&DEV_1005" "PCI\\VEN_1AF4&DEV_1044"',
                     '"PCI\\VEN_1AF4&DEV_105A"',
                     '"PCI\\VEN_1AF4&DEV_1003" "PCI\\VEN_1AF4&DEV_1043"',
                     '"ACPI\\QEMU0001"',
@@ -36,9 +36,9 @@ device_hwid_list = ['"PCI\\VEN_1AF4&DEV_1005" "PCI\\VEN_1AF4&DEV_1044"',
                     '"PCI\\VEN_1AF4&DEV_1052"',
                     '"ACPI\\VEN_QEMU&DEV_0002"']
 
-device_name_list = ["VirtIO RNG Device", "Red Hat VirtIO SCSI controller",
+device_name_list = ["VirtIO Balloon Driver", "Red Hat VirtIO SCSI controller",
                     "Red Hat VirtIO SCSI pass-through controller",
-                    "VirtIO Balloon Driver", "VirtIO FS Device",
+                    "VirtIO RNG Device", "VirtIO FS Device",
                     "VirtIO Serial Driver", "QEMU PVPanic Device",
                     "Red Hat VirtIO Ethernet Adapter", "VirtIO Input Driver",
                     "QEMU FwCfg Device"]
@@ -100,29 +100,32 @@ def win_uninstall_all_drivers(session, test, params):
 
 
 @error_context.context_aware
-def install_test_with_screen_on_desktop(vm, session, test, run_install_cmd,
-                                        installer_pkg_check_cmd,
-                                        copy_files_params=None):
+def run_installer_with_interaction(vm, session, test, params,
+                                   run_installer_cmd,
+                                   copy_files_params=None):
     """
-    Install test when guest screen on desktop.
+    Install/uninstall/repair virtio-win drivers and qxl,spice and
+    qemu-ga-win by installer.
 
     :param vm: vm object
     :param session: The guest session object.
     :param test: kvm test object.
-    :param run_install_cmd: install cmd.
-    :param installer_pkg_check_cmd: installer pkg check cmd.
+    :param params: the dict used for parameters
+    :param run_installer_cmd: install/uninstall/repair cmd cmd.
     :param copy_files_params: copy files params.
+    :return session: a new session after restart of installer
     """
-    error_context.context("Install virtio-win drivers via "
-                          "virtio-win-guest-tools.exe.", LOG_JOB.info)
+    error_context.context("Run virtio-win-guest-tools.exe by %s."
+                          % run_installer_cmd, LOG_JOB.info)
     vm.send_key('meta_l-d')
     time.sleep(30)
     if copy_files_params:
         win_driver_utils.copy_file_to_samepath(session, test,
                                                copy_files_params)
-    win_driver_utils.install_driver_by_installer(session, test,
-                                                 run_install_cmd,
-                                                 installer_pkg_check_cmd)
+    session = win_driver_utils.run_installer(vm, session,
+                                             test, params,
+                                             run_installer_cmd)
+    return session
 
 
 @error_context.context_aware
@@ -396,5 +399,6 @@ def fwcfg_test(test, params, vm):
     else:
         cmd = "ls -l %s | awk '{print $5}'" % dump_file
         dump_size = int(process.getoutput(cmd))
+        process.system("rm -rf %s" % dump_file, shell=True)
         if dump_size == 0:
             test.fail("The dump file is empty")
